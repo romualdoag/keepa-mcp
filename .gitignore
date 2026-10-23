@@ -2,3 +2,8 @@ node_modules/
 dist/
 *.log
 .DS_Store
+# Cache frio local (dados de terceiros, descartável) — nunca commitar.
+*.sqlite*
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

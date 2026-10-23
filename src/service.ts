@@ -21,6 +21,15 @@ import {
   proxyUrl,
 } from "./protocol.js";
 import { ProxyAgent } from "undici";
+import {
+  __resetForTests as __resetColdForTests,
+  cacheTtlMs,
+  isHistoricQuery,
+  kvClear,
+  kvGet,
+  kvGetStale,
+  kvSet,
+} from "./cache.js";
 
 /** amazon.<tld> → domainId Keepa */
 const DOMAIN_BY_TLD: Record<string, number> = {
@@ -104,20 +113,38 @@ export interface CacheEntry {
   data: StatsResult;
 }
 
-const CACHE_TTL_MS = Number(process.env.KEEPA_CACHE_TTL_MS ?? 3 * 3600_000);
 const cache = new Map<string, CacheEntry>();
 const seriesCache = new Map<
   string,
   { at: number; data: { t: number; price: number }[] }
 >();
 
+/** Chaves do KV frio (espelham o cache quente em memória). */
+const statsKey = (asin: string, domainId: number): string =>
+  `stats:${cacheKey(asin, domainId)}`;
+const seriesKey = (asin: string, domainId: number): string =>
+  `series:${cacheKey(asin, domainId)}`;
+
 export function cacheKey(asin: string, domainId: number): string {
   return `${domainId}-${asin}`;
 }
 
+/** Limpa quente (memória) + frio (SQLite). */
 export function clearCache(): void {
+  clearMemoryCache();
+  kvClear();
+}
+
+/** Limpa só a memória — simula restart do gateway (o SQLite frio sobrevive). */
+export function clearMemoryCache(): void {
   cache.clear();
   seriesCache.clear();
+}
+
+/** Test hook: zera tudo e aponta o SQLite p/ outro arquivo (ou ':memory:'). */
+export function __resetForTests(dbPath = ":memory:"): void {
+  clearMemoryCache();
+  __resetColdForTests(dbPath);
 }
 
 export async function getPriceStats(
@@ -126,9 +153,19 @@ export async function getPriceStats(
   fetchProduct: FetchProduct = fetchProductLive,
   nowMin: number = nowKeepaMin(),
 ): Promise<StatsResult> {
+  const ttlMs = cacheTtlMs();
   const key = cacheKey(asin, domainId);
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.data;
+  if (hit && Date.now() - hit.at < ttlMs) return hit.data;
+  const cold = kvGet<StatsResult>(statsKey(asin, domainId), ttlMs);
+  if (cold) {
+    cache.set(key, { at: Date.now(), data: cold });
+    return cold;
+  }
+  // Range histórico já coberto serve infinito: o Keepa só anexa pontos novos.
+  // (Sem requentar o L1: dado expirado não deve mascarar o TTL do recente.)
+  const stale = kvGetStale<StatsResult>(statsKey(asin, domainId));
+  if (stale && isHistoricQuery(nowMin)) return stale.value;
 
   const bp = await fetchProduct(asin, domainId);
   const novoPts = parseSeries(bp.csv?.[CSV.NEW]);
@@ -165,6 +202,10 @@ export async function getPriceStats(
     amazonAtual: lastOf(CSV.AMAZON),
   };
   cache.set(key, { at: Date.now(), data: out });
+  kvSet(statsKey(asin, domainId), out);
+  // O fetch já trouxe a série completa: alimenta o cache da history de graça.
+  seriesCache.set(`csv:${key}`, { at: Date.now(), data: novoPts });
+  kvSet(seriesKey(asin, domainId), novoPts);
   return out;
 }
 
@@ -195,15 +236,35 @@ export async function getPriceHistory(
   days: number;
   points: Array<{ date: string; price: number }>;
 }> {
+  const ttlMs = cacheTtlMs();
   const key = `csv:${cacheKey(asin, domainId)}`;
   let pts: { t: number; price: number }[];
   const hit = seriesCache.get(key);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
+  if (hit && Date.now() - hit.at < ttlMs) {
     pts = hit.data;
   } else {
-    const bp = await fetchProduct(asin, domainId);
-    pts = parseSeries(bp.csv?.[CSV.NEW]);
-    seriesCache.set(key, { at: Date.now(), data: pts });
+    const cold = kvGet<{ t: number; price: number }[]>(
+      seriesKey(asin, domainId),
+      ttlMs,
+    );
+    if (cold) {
+      pts = cold;
+      seriesCache.set(key, { at: Date.now(), data: pts });
+    } else {
+      // Range histórico já coberto serve infinito (série antiga é imutável).
+      // (Sem requentar o L1: dado expirado não deve mascarar o TTL do recente.)
+      const stale = kvGetStale<{ t: number; price: number }[]>(
+        seriesKey(asin, domainId),
+      );
+      if (stale && isHistoricQuery(nowMin)) {
+        pts = stale.value;
+      } else {
+        const bp = await fetchProduct(asin, domainId);
+        pts = parseSeries(bp.csv?.[CSV.NEW]);
+        seriesCache.set(key, { at: Date.now(), data: pts });
+        kvSet(seriesKey(asin, domainId), pts);
+      }
+    }
   }
   return { asin, domainId, days, points: history(pts, nowMin, days) };
 }

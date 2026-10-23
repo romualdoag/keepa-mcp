@@ -4,7 +4,7 @@
  * menor $118.99 em 23/05/2026, atual $119.00, maior $179.00 em 31/01/2025,
  * média 90d $137.67, média 180d $138.18 → veredito esperado: OTIMO.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -21,6 +21,8 @@ import {
 import {
   analyzeAmazonPrice,
   clearCache,
+  clearMemoryCache,
+  __resetForTests,
   getPriceHistory,
   getPriceStats,
   resolveAmazonUrl,
@@ -38,6 +40,11 @@ const fetchFixture = async (asin: string, domainId: number): Promise<BasicProduc
   asin,
   domainId,
   csv: [null, fixture.csv1_NEW, fixture.csv2_USED] as BasicProduct["csv"],
+});
+
+// Cache frio isolado por teste: SQLite em memória, zero vazamento entre testes.
+beforeEach(() => {
+  __resetForTests(":memory:");
 });
 
 describe("quadro Keepa (fixture HAR)", () => {
@@ -202,5 +209,59 @@ describe("URLs e serviço (fixture)", () => {
 
   it("keepaToISODate ancora 2011-01-01", () => {
     expect(keepaToISODate(0)).toBe("2011-01-01");
+  });
+});
+
+describe("cache frio SQLite", () => {
+  it("sobrevive a restart: L1 limpo, SQLite intacto, zero refetch", async () => {
+    let calls = 0;
+    const counting: typeof fetchFixture = async (a, d) => {
+      calls++;
+      return fetchFixture(a, d);
+    };
+    const s1 = await getPriceStats("B0CZ6XY78Y", 1, counting, NOW);
+    expect(calls).toBe(1);
+    clearMemoryCache(); // simula restart do gateway
+    const s2 = await getPriceStats("B0CZ6XY78Y", 1, counting, NOW);
+    expect(calls).toBe(1);
+    expect(s2).toEqual(s1);
+  });
+
+  it("history sai do frio após restart sem refetch", async () => {
+    let calls = 0;
+    const counting: typeof fetchFixture = async (a, d) => {
+      calls++;
+      return fetchFixture(a, d);
+    };
+    const h1 = await getPriceHistory("B0CZ6XY78Y", 1, 90, counting, NOW);
+    expect(calls).toBe(1);
+    clearMemoryCache();
+    const h2 = await getPriceHistory("B0CZ6XY78Y", 1, 90, counting, NOW);
+    expect(calls).toBe(1);
+    expect(h2.points).toEqual(h1.points);
+  });
+
+  it("histórico antigo serve infinito mesmo expirado; recente refaz fetch", async () => {
+    const prev = process.env.KEEPA_CACHE_TTL_MS;
+    process.env.KEEPA_CACHE_TTL_MS = "1";
+    try {
+      let calls = 0;
+      const counting: typeof fetchFixture = async (a, d) => {
+        calls++;
+        return fetchFixture(a, d);
+      };
+      await getPriceHistory("B0CZ6XY78Y", 1, 90, counting, NOW);
+      expect(calls).toBe(1);
+      await new Promise((r) => setTimeout(r, 10)); // expira o TTL de 1ms
+      // NOW é histórico (fixture de dias atrás): serve do frio, zero chamadas.
+      await getPriceHistory("B0CZ6XY78Y", 1, 90, counting, NOW);
+      expect(calls).toBe(1);
+      // Janela recente (agora de verdade): TTL expirado refaz fetch.
+      await getPriceHistory("B0CZ6XY78Y", 1, 90, counting, nowKeepaMin());
+      expect(calls).toBe(2);
+    } finally {
+      if (prev === undefined) delete process.env.KEEPA_CACHE_TTL_MS;
+      else process.env.KEEPA_CACHE_TTL_MS = prev;
+    }
   });
 });
