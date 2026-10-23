@@ -31,7 +31,16 @@ import {
   kvSet,
 } from "./cache.js";
 
-/** amazon.<tld> → domainId Keepa */
+/**
+ * amazon.<tld> → domainId Keepa.
+ *
+ * Estabilidade: o ASIN (10 chars `[A-Z0-9]`, normalizado via `cacheKey`
+ * com trim + uppercase) é estável — o formato não muda. Já este mapa
+ * TLD→domainId PODE ganhar entradas (novos marketplaces Amazon; ex.
+ * `amazon.com.br` → 12 veio depois). `DOMAIN_MAP_VERSION` versiona o
+ * mapa: incremente ao adicionar/remover TLDs.
+ */
+export const DOMAIN_MAP_VERSION = 1;
 const DOMAIN_BY_TLD: Record<string, number> = {
   "com": 1,
   "co.uk": 2,
@@ -119,14 +128,53 @@ const seriesCache = new Map<
   { at: number; data: { t: number; price: number }[] }
 >();
 
-/** Chaves do KV frio (espelham o cache quente em memória). */
+/**
+ * Chaves do KV frio (espelham o cache quente em memória). Prefixo `v1:`
+ * versiona o formato; a leitura cai p/ a chave legada sem prefixo quando
+ * a nova não existe (migração lazy: regrava na chave nova, fail-soft —
+ * `kvSet` nunca joga — então o fallback nunca quebra a chamada).
+ */
 const statsKey = (asin: string, domainId: number): string =>
-  `stats:${cacheKey(asin, domainId)}`;
+  `v1:stats:${cacheKey(asin, domainId)}`;
 const seriesKey = (asin: string, domainId: number): string =>
+  `v1:series:${cacheKey(asin, domainId)}`;
+const legacyStatsKey = (asin: string, domainId: number): string =>
+  `stats:${cacheKey(asin, domainId)}`;
+const legacySeriesKey = (asin: string, domainId: number): string =>
   `series:${cacheKey(asin, domainId)}`;
+/** Chave quente (memória) da série — `v1:csv:` com fallback da legada `csv:`. */
+const seriesMemKey = (asin: string, domainId: number): string =>
+  `v1:csv:${cacheKey(asin, domainId)}`;
+const legacySeriesMemKey = (asin: string, domainId: number): string =>
+  `csv:${cacheKey(asin, domainId)}`;
 
 export function cacheKey(asin: string, domainId: number): string {
-  return `${domainId}-${asin}`;
+  return `${Number(domainId)}-${asin.trim().toUpperCase()}`;
+}
+
+/** Lê a chave nova (`v1:`); em miss, tenta a legada e migra lazy (fail-soft). */
+function kvGetNewOrLegacy<T>(fresh: string, legacy: string, ttlMs: number): T | undefined {
+  const hit = kvGet<T>(fresh, ttlMs);
+  if (hit !== undefined) return hit;
+  if (legacy === fresh) return undefined;
+  const old = kvGet<T>(legacy, ttlMs);
+  if (old === undefined) return undefined;
+  kvSet(fresh, old); // fail-soft: kvSet nunca joga
+  return old;
+}
+
+/** Idem, sem TTL (range histórico imutável). */
+function kvGetStaleNewOrLegacy<T>(
+  fresh: string,
+  legacy: string,
+): { value: T; fetchedAt: number } | undefined {
+  const hit = kvGetStale<T>(fresh);
+  if (hit) return hit;
+  if (legacy === fresh) return undefined;
+  const old = kvGetStale<T>(legacy);
+  if (!old) return undefined;
+  kvSet(fresh, old.value); // fail-soft
+  return old;
 }
 
 /** Limpa quente (memória) + frio (SQLite). */
@@ -154,17 +202,26 @@ export async function getPriceStats(
   nowMin: number = nowKeepaMin(),
 ): Promise<StatsResult> {
   const ttlMs = cacheTtlMs();
+  asin = asin.trim().toUpperCase();
+  domainId = Number(domainId);
   const key = cacheKey(asin, domainId);
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < ttlMs) return hit.data;
-  const cold = kvGet<StatsResult>(statsKey(asin, domainId), ttlMs);
+  const cold = kvGetNewOrLegacy<StatsResult>(
+    statsKey(asin, domainId),
+    legacyStatsKey(asin, domainId),
+    ttlMs,
+  );
   if (cold) {
     cache.set(key, { at: Date.now(), data: cold });
     return cold;
   }
   // Range histórico já coberto serve infinito: o Keepa só anexa pontos novos.
   // (Sem requentar o L1: dado expirado não deve mascarar o TTL do recente.)
-  const stale = kvGetStale<StatsResult>(statsKey(asin, domainId));
+  const stale = kvGetStaleNewOrLegacy<StatsResult>(
+    statsKey(asin, domainId),
+    legacyStatsKey(asin, domainId),
+  );
   if (stale && isHistoricQuery(nowMin)) return stale.value;
 
   const bp = await fetchProduct(asin, domainId);
@@ -204,7 +261,7 @@ export async function getPriceStats(
   cache.set(key, { at: Date.now(), data: out });
   kvSet(statsKey(asin, domainId), out);
   // O fetch já trouxe a série completa: alimenta o cache da history de graça.
-  seriesCache.set(`csv:${key}`, { at: Date.now(), data: novoPts });
+  seriesCache.set(seriesMemKey(asin, domainId), { at: Date.now(), data: novoPts });
   kvSet(seriesKey(asin, domainId), novoPts);
   return out;
 }
@@ -237,14 +294,19 @@ export async function getPriceHistory(
   points: Array<{ date: string; price: number }>;
 }> {
   const ttlMs = cacheTtlMs();
-  const key = `csv:${cacheKey(asin, domainId)}`;
+  asin = asin.trim().toUpperCase();
+  domainId = Number(domainId);
+  const key = seriesMemKey(asin, domainId);
+  const legacyKey = legacySeriesMemKey(asin, domainId);
   let pts: { t: number; price: number }[];
-  const hit = seriesCache.get(key);
+  const hit = seriesCache.get(key) ?? seriesCache.get(legacyKey);
   if (hit && Date.now() - hit.at < ttlMs) {
     pts = hit.data;
+    if (!seriesCache.has(key)) seriesCache.set(key, hit); // migra lazy o quente
   } else {
-    const cold = kvGet<{ t: number; price: number }[]>(
+    const cold = kvGetNewOrLegacy<{ t: number; price: number }[]>(
       seriesKey(asin, domainId),
+      legacySeriesKey(asin, domainId),
       ttlMs,
     );
     if (cold) {
@@ -253,8 +315,9 @@ export async function getPriceHistory(
     } else {
       // Range histórico já coberto serve infinito (série antiga é imutável).
       // (Sem requentar o L1: dado expirado não deve mascarar o TTL do recente.)
-      const stale = kvGetStale<{ t: number; price: number }[]>(
+      const stale = kvGetStaleNewOrLegacy<{ t: number; price: number }[]>(
         seriesKey(asin, domainId),
+        legacySeriesKey(asin, domainId),
       );
       if (stale && isHistoricQuery(nowMin)) {
         pts = stale.value;
